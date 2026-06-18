@@ -125,6 +125,13 @@ pub struct ResolvedWindowRules {
 
     /// Rules for this window's popups.
     pub popups: ResolvedPopupsRules,
+
+    /// Skip the compositor-side inverse-ICC correction for this window.
+    ///
+    /// Set to `true` for apps that already handle their own color management (mpv, Krita,
+    /// Firefox, …). When `true` and the output has an `icc-profile`, the inverse-CTM shader
+    /// is not applied to this window's surfaces so the DRM CTM reaches them unmodified.
+    pub icc_passthrough: Option<bool>,
 }
 
 impl<'a> WindowRef<'a> {
@@ -301,6 +308,10 @@ impl ResolvedWindowRules {
                 }
                 if let Some(x) = rule.tiled_state {
                     resolved.tiled_state = Some(x);
+                }
+
+                if let Some(x) = rule.icc_passthrough {
+                    resolved.icc_passthrough = Some(x);
                 }
 
                 resolved

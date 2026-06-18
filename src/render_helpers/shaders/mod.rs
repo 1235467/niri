@@ -21,6 +21,9 @@ pub struct Shaders {
     pub custom_resize: RefCell<Option<ShaderProgram>>,
     pub custom_close: RefCell<Option<ShaderProgram>>,
     pub custom_open: RefCell<Option<ShaderProgram>>,
+    /// Shader that applies the inverse of the DRM CTM so color-managed windows are not
+    /// double-corrected by the hardware color transform.
+    pub icc_passthrough: Option<GlesTexProgram>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -148,6 +151,16 @@ impl Shaders {
             })
             .ok();
 
+        let icc_passthrough = renderer
+            .compile_custom_texture_shader(
+                include_str!("icc_passthrough.frag"),
+                &[UniformName::new("icc_ctm_inverse", UniformType::Matrix3x3)],
+            )
+            .map_err(|err| {
+                warn!("error compiling ICC passthrough shader: {err:?}");
+            })
+            .ok();
+
         Self {
             border,
             shadow,
@@ -159,6 +172,7 @@ impl Shaders {
             custom_resize: RefCell::new(None),
             custom_close: RefCell::new(None),
             custom_open: RefCell::new(None),
+            icc_passthrough,
         }
     }
 

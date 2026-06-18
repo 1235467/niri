@@ -374,6 +374,13 @@ struct TtyOutputState {
     crtc: crtc::Handle,
 }
 
+/// Output user data: inverse of the ICC CTM (display→sRGB, linear light).
+///
+/// Stored on the `Output` when an ICC profile with a valid CTM is applied to the CRTC.
+/// Read by `niri.rs::add_output()` to populate `OutputState::icc_ctm_inverse`.
+#[derive(Debug, Clone, Copy)]
+pub struct IccCtmInverse(pub [f32; 9]);
+
 struct Surface {
     name: OutputName,
     compositor: GbmDrmCompositor,
@@ -403,6 +410,13 @@ struct GammaProps {
     gamma_lut: property::Handle,
     gamma_lut_size: property::Handle,
     previous_blob: Option<NonZeroU64>,
+    /// Optional CTM (Color Transform Matrix) property handle on the CRTC.
+    ctm: Option<property::Handle>,
+    previous_ctm_blob: Option<NonZeroU64>,
+    /// Optional DEGAMMA_LUT property handle on the CRTC.
+    degamma_lut: Option<property::Handle>,
+    degamma_lut_size: Option<property::Handle>,
+    previous_degamma_blob: Option<NonZeroU64>,
 }
 
 struct ConnectorProperties<'a> {
@@ -1338,6 +1352,12 @@ impl Tty {
             debug!("couldn't reset gamma: {err:?}");
         }
 
+        // Apply ICC profile if configured.
+        let icc_ctm_inverse = config
+            .icc_profile
+            .as_ref()
+            .and_then(|icc_path| apply_icc_to_gamma_props(&mut gamma_props, &device.drm, icc_path));
+
         let surface = device
             .drm
             .create_surface(crtc, mode, &[connector.handle()])?;
@@ -1395,6 +1415,9 @@ impl Tty {
         output.user_data().insert_if_missing(|| output_name.clone());
         if let Some(x) = orientation {
             output.user_data().insert_if_missing(|| PanelOrientation(x));
+        }
+        if let Some(inv) = icc_ctm_inverse {
+            output.user_data().insert_if_missing(|| IccCtmInverse(inv));
         }
 
         let render_node = device.render_node.unwrap_or(self.primary_render_node);
@@ -1888,10 +1911,15 @@ impl Tty {
         };
 
         // Render the elements.
+        let icc_ctm_inverse = niri
+            .output_state
+            .get(output)
+            .and_then(|s| s.icc_ctm_inverse);
         let ctx = RenderCtx {
             renderer: &mut renderer,
             target: RenderTarget::Output,
             xray: None,
+            icc_ctm_inverse,
         };
         let mut elements = niri.render_to_vec(ctx, output, true);
 
@@ -2611,6 +2639,9 @@ impl GammaProps {
     fn new(device: &DrmDevice, crtc: crtc::Handle) -> anyhow::Result<Self> {
         let mut gamma_lut = None;
         let mut gamma_lut_size = None;
+        let mut ctm = None;
+        let mut degamma_lut = None;
+        let mut degamma_lut_size = None;
 
         let props = device
             .get_properties(crtc)
@@ -2639,6 +2670,21 @@ impl GammaProps {
                     );
                     gamma_lut_size = Some(prop);
                 }
+                "CTM" => {
+                    if matches!(info.value_type(), property::ValueType::Blob) {
+                        ctm = Some(prop);
+                    }
+                }
+                "DEGAMMA_LUT" => {
+                    if matches!(info.value_type(), property::ValueType::Blob) {
+                        degamma_lut = Some(prop);
+                    }
+                }
+                "DEGAMMA_LUT_SIZE" => {
+                    if matches!(info.value_type(), property::ValueType::UnsignedRange(_, _)) {
+                        degamma_lut_size = Some(prop);
+                    }
+                }
                 _ => (),
             }
         }
@@ -2651,6 +2697,11 @@ impl GammaProps {
             gamma_lut,
             gamma_lut_size,
             previous_blob: None,
+            ctm,
+            previous_ctm_blob: None,
+            degamma_lut,
+            degamma_lut_size,
+            previous_degamma_blob: None,
         })
     }
 
@@ -2740,6 +2791,121 @@ impl GammaProps {
                 property::Value::Blob(blob).into(),
             )
             .context("error setting GAMMA_LUT")?;
+
+        Ok(())
+    }
+
+    /// Apply ICC-derived color transforms (DEGAMMA_LUT, CTM, GAMMA_LUT) to this CRTC.
+    ///
+    /// Pass `None` to clear all ICC transforms and reset to identity.
+    fn set_color_transform(
+        &mut self,
+        device: &DrmDevice,
+        transforms: Option<&crate::icc::IccTransforms>,
+    ) -> anyhow::Result<()> {
+        let _span = tracy_client::span!("GammaProps::set_color_transform");
+
+        // --- DEGAMMA_LUT ---
+        if let Some(degamma_prop) = self.degamma_lut {
+            let new_blob = if let Some(t) = transforms {
+                let mut data = bytemuck::cast_slice::<_, u8>(&t.degamma).to_vec();
+                let blob = drm_ffi::mode::create_property_blob(device.as_fd(), &mut data)
+                    .context("error creating DEGAMMA_LUT blob")?;
+                NonZeroU64::new(u64::from(blob.blob_id))
+            } else {
+                None
+            };
+
+            let blob_val = new_blob.map(NonZeroU64::get).unwrap_or(0);
+            device
+                .set_property(
+                    self.crtc,
+                    degamma_prop,
+                    property::Value::Blob(blob_val).into(),
+                )
+                .context("error setting DEGAMMA_LUT")
+                .inspect_err(|_| {
+                    if blob_val != 0 {
+                        if let Err(err) = device.destroy_property_blob(blob_val) {
+                            warn!("error destroying DEGAMMA_LUT blob: {err:?}");
+                        }
+                    }
+                })?;
+
+            if let Some(old) = mem::replace(&mut self.previous_degamma_blob, new_blob) {
+                if let Err(err) = device.destroy_property_blob(old.get()) {
+                    warn!("error destroying previous DEGAMMA_LUT blob: {err:?}");
+                }
+            }
+        }
+
+        // --- CTM ---
+        if let Some(ctm_prop) = self.ctm {
+            let new_blob = if let Some(t) = transforms {
+                let mut data = bytemuck::cast_slice::<_, u8>(std::slice::from_ref(&t.ctm)).to_vec();
+                let blob = drm_ffi::mode::create_property_blob(device.as_fd(), &mut data)
+                    .context("error creating CTM blob")?;
+                NonZeroU64::new(u64::from(blob.blob_id))
+            } else {
+                None
+            };
+
+            let blob_val = new_blob.map(NonZeroU64::get).unwrap_or(0);
+            device
+                .set_property(
+                    self.crtc,
+                    ctm_prop,
+                    property::Value::Blob(blob_val).into(),
+                )
+                .context("error setting CTM")
+                .inspect_err(|_| {
+                    if blob_val != 0 {
+                        if let Err(err) = device.destroy_property_blob(blob_val) {
+                            warn!("error destroying CTM blob: {err:?}");
+                        }
+                    }
+                })?;
+
+            if let Some(old) = mem::replace(&mut self.previous_ctm_blob, new_blob) {
+                if let Err(err) = device.destroy_property_blob(old.get()) {
+                    warn!("error destroying previous CTM blob: {err:?}");
+                }
+            }
+        }
+
+        // --- GAMMA_LUT (override with ICC gamma if provided, else keep existing ramp) ---
+        if transforms.is_some() {
+            // Apply the display TRC as the GAMMA_LUT.
+            let t = transforms.unwrap();
+            let mut data = bytemuck::cast_slice::<_, u8>(&t.gamma).to_vec();
+            let new_blob = {
+                let blob = drm_ffi::mode::create_property_blob(device.as_fd(), &mut data)
+                    .context("error creating GAMMA_LUT (ICC) blob")?;
+                NonZeroU64::new(u64::from(blob.blob_id))
+            };
+
+            let blob_val = new_blob.map(NonZeroU64::get).unwrap_or(0);
+            device
+                .set_property(
+                    self.crtc,
+                    self.gamma_lut,
+                    property::Value::Blob(blob_val).into(),
+                )
+                .context("error setting GAMMA_LUT (ICC)")
+                .inspect_err(|_| {
+                    if blob_val != 0 {
+                        if let Err(err) = device.destroy_property_blob(blob_val) {
+                            warn!("error destroying GAMMA_LUT (ICC) blob: {err:?}");
+                        }
+                    }
+                })?;
+
+            if let Some(old) = mem::replace(&mut self.previous_blob, new_blob) {
+                if let Err(err) = device.destroy_property_blob(old.get()) {
+                    warn!("error destroying previous GAMMA_LUT blob: {err:?}");
+                }
+            }
+        }
 
         Ok(())
     }
@@ -3446,6 +3612,50 @@ pub fn set_gamma_for_crtc(
         .context("error setting gamma")?;
 
     Ok(())
+}
+
+/// Load an ICC profile from `path` and apply it to the CRTC via DRM color management blobs.
+///
+/// Requires the CRTC to support CTM and DEGAMMA_LUT properties (kernel 4.14+, i915/amdgpu/etc).
+/// If those properties are not available on this CRTC, a warning is logged and the ICC is skipped.
+///
+/// Returns the inverse of the CTM (display→sRGB, linear light) so it can be stored and later used
+/// by the GPU-side ICC passthrough shader for color-managed windows.
+fn apply_icc_to_gamma_props(
+    gamma_props: &mut Option<GammaProps>,
+    device: &DrmDevice,
+    path: &std::path::Path,
+) -> Option<[f32; 9]> {
+    let transforms = match crate::icc::load_icc(path) {
+        Ok(t) => t,
+        Err(err) => {
+            warn!("failed to load ICC profile {:?}: {err:?}", path);
+            return None;
+        }
+    };
+
+    let Some(props) = gamma_props else {
+        warn!(
+            "ICC profile configured but CRTC does not support GAMMA_LUT property; \
+             ICC color management not applied"
+        );
+        return None;
+    };
+
+    if props.ctm.is_none() {
+        warn!(
+            "ICC profile configured but CRTC does not support CTM property; \
+             color transform matrix will not be applied (output may look wrong for wide-gamut displays)"
+        );
+    }
+
+    if let Err(err) = props.set_color_transform(device, Some(&transforms)) {
+        warn!("error applying ICC color transforms: {err:?}");
+        None
+    } else {
+        debug!("applied ICC profile {:?} to CRTC", path);
+        Some(transforms.ctm_inverse)
+    }
 }
 
 fn format_connector_name(connector: &connector::Info) -> String {

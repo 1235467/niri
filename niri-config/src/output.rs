@@ -1,3 +1,4 @@
+use std::path::PathBuf;
 use std::str::FromStr;
 
 use knuffel::ast::SpannedNode;
@@ -78,6 +79,8 @@ pub struct Output {
     pub hot_corners: Option<HotCorners>,
     #[knuffel(child)]
     pub layout: Option<LayoutPart>,
+    #[knuffel(child, unwrap(argument))]
+    pub icc_profile: Option<PathBuf>,
 }
 
 impl Output {
@@ -111,6 +114,7 @@ impl Default for Output {
             backdrop_color: None,
             hot_corners: None,
             layout: None,
+            icc_profile: None,
         }
     }
 }

@@ -21,6 +21,7 @@ use crate::niri_render_elements;
 use crate::render_helpers::background_effect::BackgroundEffectElement;
 use crate::render_helpers::border::BorderRenderElement;
 use crate::render_helpers::clipped_surface::{ClippedSurfaceRenderElement, RoundedCornerDamage};
+use crate::render_helpers::icc_passthrough_element::IccPassthroughRenderElement;
 use crate::render_helpers::damage::ExtraDamage;
 use crate::render_helpers::offscreen::{OffscreenBuffer, OffscreenRenderElement};
 use crate::render_helpers::renderer::NiriRenderer;
@@ -130,6 +131,7 @@ niri_render_elements! {
         Border = BorderRenderElement,
         Shadow = ShadowRenderElement,
         ClippedSurface = ClippedSurfaceRenderElement<R>,
+        IccPassthrough = IccPassthroughRenderElement<R>,
         Offscreen = OffscreenRenderElement,
         ExtraDamage = ExtraDamage,
         BackgroundEffect = BackgroundEffectElement,
@@ -1225,6 +1227,12 @@ impl<W: LayoutElement> Tile<W> {
                     error!("background effect clipping is unimplemented");
                     elem.into()
                 }
+                elem @ LayoutElementRenderElement::IccPassthrough(_) => {
+                    // ICC passthrough elements already have a custom texture shader applied.
+                    // Combining it with the clipped-surface shader is not currently supported,
+                    // so pass through without clipping.
+                    elem.into()
+                }
             };
 
             if clip_to_geometry && clip_shader.is_some() {
@@ -1421,6 +1429,7 @@ impl<W: LayoutElement> Tile<W> {
                 target: RenderTarget::Output,
                 renderer,
                 xray: xray.as_deref(),
+                icc_ctm_inverse: None,
             },
             Point::from((0., 0.)),
             xray_pos,
@@ -1472,6 +1481,7 @@ impl<W: LayoutElement> Tile<W> {
                         target: RenderTarget::Output,
                         renderer,
                         xray: Some(xray),
+                        icc_ctm_inverse: None,
                     },
                     Point::from((0., 0.)),
                     xray_pos,
@@ -1492,6 +1502,7 @@ impl<W: LayoutElement> Tile<W> {
                 target: RenderTarget::Screencast,
                 renderer,
                 xray: xray.as_deref(),
+                icc_ctm_inverse: None,
             },
             Point::from((0., 0.)),
             xray_pos,

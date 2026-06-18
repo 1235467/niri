@@ -116,7 +116,7 @@ use wayland_server::protocol::wl_output::WlOutput;
 #[cfg(feature = "dbus")]
 use crate::a11y::A11y;
 use crate::animation::Clock;
-use crate::backend::tty::SurfaceDmabufFeedback;
+use crate::backend::tty::{IccCtmInverse, SurfaceDmabufFeedback};
 use crate::backend::{Backend, Headless, RenderResult, Tty, Winit};
 use crate::cursor::{CursorManager, CursorTextureCache, RenderCursor, XCursor};
 #[cfg(feature = "dbus")]
@@ -486,6 +486,13 @@ pub struct OutputState {
     screen_transition: Option<ScreenTransition>,
     /// Damage tracker used for the debug damage visualization.
     pub debug_damage_tracker: OutputDamageTracker,
+    /// Inverse of the ICC CTM applied via DRM for this output (display→sRGB, linear light).
+    ///
+    /// `Some` when an ICC profile is active and a CTM has been applied to the DRM CRTC.
+    /// Used by the ICC passthrough shader to counteract the hardware CTM for windows that
+    /// perform their own color management (e.g. mpv, Krita, Firefox).
+    /// `None` on the winit backend or when no ICC profile is configured.
+    pub icc_ctm_inverse: Option<[f32; 9]>,
 }
 
 #[derive(Debug, Default)]
@@ -2063,6 +2070,7 @@ impl State {
                     target: RenderTarget::Output,
                     renderer,
                     xray: None,
+                    icc_ctm_inverse: None,
                 };
 
                 self.niri.fill_xray_elements(ctx.r(), output);
@@ -2872,6 +2880,7 @@ impl Niri {
         };
 
         let size = output_size(&output);
+        let icc_ctm_inverse = output.user_data().get::<IccCtmInverse>().map(|d| d.0);
         let state = OutputState {
             global,
             redraw_state: RedrawState::Idle,
@@ -2888,6 +2897,7 @@ impl Niri {
             lock_color_buffer: SolidColorBuffer::new(size, CLEAR_COLOR_LOCKED),
             screen_transition: None,
             debug_damage_tracker: OutputDamageTracker::from_output(&output),
+            icc_ctm_inverse,
         };
         let rv = self.output_state.insert(output.clone(), state);
         assert!(rv.is_none(), "output was already tracked");
@@ -5284,6 +5294,7 @@ impl Niri {
                         renderer,
                         target: RenderTarget::ScreenCapture,
                         xray: None,
+                        icc_ctm_inverse: None,
                     };
                     let offset = screencopy.region_loc().upscale(-1);
                     let mut elements = Vec::new();
@@ -5362,6 +5373,7 @@ impl Niri {
             renderer,
             target: RenderTarget::ScreenCapture,
             xray: None,
+            icc_ctm_inverse: None,
         };
         let offset = screencopy.region_loc().upscale(-1);
         let mut elements = Vec::new();
@@ -5487,6 +5499,7 @@ impl Niri {
                     renderer,
                     target,
                     xray: None,
+                    icc_ctm_inverse: None,
                 };
                 let elements = self.render_to_vec(ctx, &output, false);
                 let elements = elements.iter().rev();
@@ -5569,6 +5582,7 @@ impl Niri {
             renderer,
             target: RenderTarget::ScreenCapture,
             xray: None,
+            icc_ctm_inverse: None,
         };
         let elements = self.render_to_vec(ctx, output, include_pointer);
         let elements = elements.iter().rev();
@@ -5624,6 +5638,7 @@ impl Niri {
             renderer,
             target: RenderTarget::ScreenCapture,
             xray: None,
+            icc_ctm_inverse: None,
         };
         mapped.render(
             ctx,
@@ -5790,6 +5805,7 @@ impl Niri {
             renderer,
             target: RenderTarget::ScreenCapture,
             xray: None,
+            icc_ctm_inverse: None,
         };
         let elements = self.render_to_vec(ctx, &output, include_pointer);
         let elements = elements.iter().rev();
@@ -6268,6 +6284,7 @@ impl Niri {
                         renderer,
                         target,
                         xray: None,
+                        icc_ctm_inverse: None,
                     };
                     let elements = self.render_to_vec(ctx, &output, false);
                     let elements = elements.iter().rev();

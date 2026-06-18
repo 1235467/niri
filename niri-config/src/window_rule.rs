@@ -79,6 +79,10 @@ pub struct WindowRule {
     pub background_effect: BackgroundEffectRule,
     #[knuffel(child, default)]
     pub popups: PopupsRule,
+    /// When the output has an icc-profile set, skip the compositor ICC correction for this window.
+    /// Use for apps that handle color management themselves (mpv, Krita, Firefox, …).
+    #[knuffel(child, unwrap(argument))]
+    pub icc_passthrough: Option<bool>,
 }
 
 /// Rules for popup surfaces.

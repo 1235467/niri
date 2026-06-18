@@ -230,6 +230,7 @@ impl Winit {
             renderer: self.backend.renderer(),
             target: RenderTarget::Output,
             xray: None,
+            icc_ctm_inverse: None,
         };
         let mut elements = niri.render_to_vec(ctx, output, true);
 

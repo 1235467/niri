@@ -597,6 +597,7 @@ impl Niri {
                     renderer,
                     target: RenderTarget::Screencast,
                     xray: None,
+                    icc_ctm_inverse: None,
                 };
                 self.render(ctx, output, false, &mut |elem| elements.push(elem.into()));
 

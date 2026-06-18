@@ -30,6 +30,7 @@ pub mod background_effect;
 pub mod blur;
 pub mod border;
 pub mod clipped_surface;
+pub mod icc_passthrough_element;
 pub mod damage;
 pub mod debug;
 pub mod effect_buffer;
@@ -58,6 +59,13 @@ pub struct RenderCtx<'a, R> {
     pub renderer: &'a mut R,
     pub target: RenderTarget,
     pub xray: Option<&'a Xray>,
+    /// When the output has an ICC profile with a DRM CTM, this holds the inverse of that CTM
+    /// (display→sRGB). Used by the ICC passthrough shader to counteract the hardware CTM for
+    /// windows that manage their own color (mpv, Krita, Firefox, …).
+    ///
+    /// `None` when no ICC profile is active, or when rendering to a screencast/screenshot target
+    /// (where the DRM CTM does not apply).
+    pub icc_ctm_inverse: Option<[f32; 9]>,
 }
 
 impl<'a, R> RenderCtx<'a, R> {
@@ -68,6 +76,7 @@ impl<'a, R> RenderCtx<'a, R> {
             renderer: self.renderer,
             target: self.target,
             xray: self.xray,
+            icc_ctm_inverse: self.icc_ctm_inverse,
         }
     }
 }
@@ -78,6 +87,7 @@ impl<'a, R: AsGlesRenderer> RenderCtx<'a, R> {
             renderer: self.renderer.as_gles_renderer(),
             target: self.target,
             xray: self.xray,
+            icc_ctm_inverse: self.icc_ctm_inverse,
         }
     }
 }
