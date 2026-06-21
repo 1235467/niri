@@ -8,28 +8,32 @@ use smithay::utils::{Buffer, Physical, Rectangle, Scale, Transform};
 use super::renderer::{AsGlesFrame as _, NiriRenderer};
 use super::shaders::Shaders;
 use crate::backend::tty::{TtyFrame, TtyRenderer, TtyRendererError};
+use crate::icc::IccPassthroughParams;
 
-/// Wraps a `WaylandSurfaceRenderElement` and applies the inverse of the DRM CTM as a pre-pass,
-/// so that color-managed windows (e.g. mpv, Krita, Firefox) are not double-corrected by the
-/// hardware color transform matrix.
+/// Wraps a `WaylandSurfaceRenderElement` and pre-cancels the hardware ICC pipeline so that
+/// color-managed windows (mpv, Krita, Firefox …) are not double-corrected.
+///
+/// The hardware applies `GAMMA(CTM(DEGAMMA(s)))` to whatever this shader writes. To make a
+/// passthrough pixel `p` survive unchanged the shader writes
+/// `linear_to_srgb( ctm_inverse · display_eotf(p) )` — linearising with the *display* TRC
+/// (not sRGB) is what cancels the GAMMA_LUT alongside the CTM.
 #[derive(Debug)]
 pub struct IccPassthroughRenderElement<R: NiriRenderer> {
     inner: WaylandSurfaceRenderElement<R>,
     program: GlesTexProgram,
-    /// Inverse CTM as a column-major `[f32; 9]` (display-native → sRGB, linear light).
-    ctm_inverse: [f32; 9],
+    params: IccPassthroughParams,
 }
 
 impl<R: NiriRenderer> IccPassthroughRenderElement<R> {
     pub fn new(
         elem: WaylandSurfaceRenderElement<R>,
         program: GlesTexProgram,
-        ctm_inverse: [f32; 9],
+        params: IccPassthroughParams,
     ) -> Self {
         Self {
             inner: elem,
             program,
-            ctm_inverse,
+            params,
         }
     }
 
@@ -38,15 +42,19 @@ impl<R: NiriRenderer> IccPassthroughRenderElement<R> {
     }
 
     fn uniforms(&self) -> Vec<Uniform<'static>> {
-        // ctm_inverse is stored row-major (see src/icc.rs); ask GL to transpose
-        // on upload so the shader sees the correct column-major matrix.
-        vec![Uniform::new(
-            "icc_ctm_inverse",
-            UniformValue::Matrix3x3 {
-                matrices: vec![self.ctm_inverse],
-                transpose: true,
-            },
-        )]
+        let [gr, gg, gb] = self.params.display_gamma;
+        vec![
+            // ctm_inverse is stored row-major (see src/icc.rs); ask GL to transpose
+            // on upload so the shader sees the correct column-major matrix.
+            Uniform::new(
+                "icc_ctm_inverse",
+                UniformValue::Matrix3x3 {
+                    matrices: vec![self.params.ctm_inverse],
+                    transpose: true,
+                },
+            ),
+            Uniform::new("display_gamma", UniformValue::_3f(gr, gg, gb)),
+        ]
     }
 }
 

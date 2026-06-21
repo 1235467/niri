@@ -13,7 +13,6 @@
 ///     → GAMMA_LUT    (apply display TRC → encoded signal for panel)
 ///     → [panel]
 
-use std::io;
 use std::path::Path;
 
 // ---------------------------------------------------------------------------
@@ -39,26 +38,54 @@ pub struct DrmColorCtm {
 }
 
 /// Everything needed to apply an ICC profile via DRM color management.
+/// Parameters consumed by the GPU-side ICC passthrough shader.
+///
+/// Carried alongside an output whenever an ICC profile is active, so passthrough windows
+/// (mpv, Krita, Firefox with CMS) can be rendered through a shader that pre-cancels the
+/// hardware color pipeline (DEGAMMA → CTM → GAMMA).
+#[derive(Debug, Clone, Copy)]
+pub struct IccPassthroughParams {
+    /// Inverse of the DRM CTM, row-major (display-linear → sRGB-linear).
+    pub ctm_inverse: [f32; 9],
+    /// Effective per-channel display gamma exponent. The shader uses
+    /// `display_linear = encoded^display_gamma` to invert the hardware GAMMA_LUT, so the
+    /// CTM cancellation operates in the same linear space the hardware does.
+    pub display_gamma: [f32; 3],
+}
+
 pub struct IccTransforms {
     /// DEGAMMA_LUT: 1D LUT removing sRGB EOTF (linearise input).
-    /// Length = `lut_size`, values are u16 (0..=65535 = 0.0..=1.0).
-    /// Stored as interleaved [DrmColorLut; lut_size].
+    /// Length matches the CRTC's `DEGAMMA_LUT_SIZE`; values are u16 (0..=65535 = 0.0..=1.0).
+    /// Stored as interleaved `[DrmColorLut]`.
     pub degamma: Vec<DrmColorLut>,
     /// CTM: sRGB linear → display-primary linear transform.
     pub ctm: DrmColorCtm,
     /// GAMMA_LUT: 1D LUT applying display TRC (re-encode for panel).
+    /// Length matches the CRTC's `GAMMA_LUT_SIZE`.
     pub gamma: Vec<DrmColorLut>,
     /// The inverse of the CTM matrix as row-major f32[9], for use in the GPU-side passthrough
     /// shader (applied to windows that manage their own color — mpv, Krita, Firefox, etc.).
     /// Multiplying a pixel through this matrix undoes the DRM CTM so the output is identity.
     pub ctm_inverse: [f32; 9],
+    /// Effective per-channel display gamma exponent (the display TRC's EOTF approximated as
+    /// `linear = encoded^gamma`). Used by the passthrough shader to linearise the app's output
+    /// with the *display's* transfer function instead of sRGB, so the hardware GAMMA_LUT is
+    /// also cancelled (not just the CTM). Order: [r, g, b].
+    pub display_gamma: [f32; 3],
 }
 
 /// Parse an ICC profile from a file and compute the DRM transforms.
-pub fn load_icc(path: &Path) -> anyhow::Result<IccTransforms> {
+///
+/// `degamma_size` / `gamma_size` must be the CRTC's reported `DEGAMMA_LUT_SIZE` /
+/// `GAMMA_LUT_SIZE`, so the produced blobs match what the hardware accepts.
+pub fn load_icc(
+    path: &Path,
+    degamma_size: usize,
+    gamma_size: usize,
+) -> anyhow::Result<IccTransforms> {
     let data = std::fs::read(path)?;
     let profile = IccProfile::parse(&data)?;
-    profile.into_drm_transforms(4096)
+    profile.into_drm_transforms(degamma_size, gamma_size)
 }
 
 // ---------------------------------------------------------------------------
@@ -410,7 +437,14 @@ impl IccProfile {
         })
     }
 
-    fn into_drm_transforms(self, lut_size: usize) -> anyhow::Result<IccTransforms> {
+    fn into_drm_transforms(
+        self,
+        degamma_size: usize,
+        gamma_size: usize,
+    ) -> anyhow::Result<IccTransforms> {
+        anyhow::ensure!(degamma_size >= 2, "DEGAMMA_LUT_SIZE too small ({degamma_size})");
+        anyhow::ensure!(gamma_size >= 2, "GAMMA_LUT_SIZE too small ({gamma_size})");
+
         // --- CTM ---
         // We want: display_linear = CTM × sRGB_linear
         // CTM = M_display^-1 × M_sRGB_D50
@@ -422,9 +456,9 @@ impl IccProfile {
         let ctm = DrmColorCtm { matrix };
 
         // --- DEGAMMA_LUT: remove sRGB EOTF → linear ---
-        let mut degamma = Vec::with_capacity(lut_size);
-        for i in 0..lut_size {
-            let x = i as f64 / (lut_size - 1) as f64;
+        let mut degamma = Vec::with_capacity(degamma_size);
+        for i in 0..degamma_size {
+            let x = i as f64 / (degamma_size - 1) as f64;
             let lin = srgb_eotf(x);
             let v = (lin.clamp(0.0, 1.0) * 65535.0 + 0.5) as u16;
             degamma.push(DrmColorLut {
@@ -437,9 +471,9 @@ impl IccProfile {
 
         // --- GAMMA_LUT: apply display TRC → encoded signal ---
         // Each channel may have its own TRC.
-        let mut gamma = Vec::with_capacity(lut_size);
-        for i in 0..lut_size {
-            let x = i as f64 / (lut_size - 1) as f64;
+        let mut gamma = Vec::with_capacity(gamma_size);
+        for i in 0..gamma_size {
+            let x = i as f64 / (gamma_size - 1) as f64;
             let r = (self.trc_r.oetf(x).clamp(0.0, 1.0) * 65535.0 + 0.5) as u16;
             let g = (self.trc_g.oetf(x).clamp(0.0, 1.0) * 65535.0 + 0.5) as u16;
             let b = (self.trc_b.oetf(x).clamp(0.0, 1.0) * 65535.0 + 0.5) as u16;
@@ -456,12 +490,65 @@ impl IccProfile {
         let ctm_inv_mat = mat3_inv(&ctm_mat)?;
         let ctm_inverse = ctm_inv_mat.map(|x| x as f32);
 
+        // Estimate a single effective gamma exponent per channel from the TRC. Used by the
+        // passthrough shader: `linear = encoded^gamma` cancels the hardware GAMMA_LUT to a
+        // good approximation for real display profiles (pure power curves are exact; sampled
+        // and parametric curves match within a few LSBs of typical display TRCs).
+        let display_gamma = [
+            estimate_gamma(&self.trc_r) as f32,
+            estimate_gamma(&self.trc_g) as f32,
+            estimate_gamma(&self.trc_b) as f32,
+        ];
+
         Ok(IccTransforms {
             degamma,
             ctm,
             gamma,
             ctm_inverse,
+            display_gamma,
         })
+    }
+}
+
+/// Approximate the EOTF (encoded → linear) of a TRC as a single gamma exponent.
+///
+/// Exact for pure-power curves; for parametric/sampled curves, fits `linear = encoded^g`
+/// by least-squares in log-log on a fixed sample grid (skipping the toe near 0 where any
+/// linear segment dominates and would skew the exponent).
+fn estimate_gamma(trc: &Trc) -> f64 {
+    if let Trc::Gamma(g) = trc {
+        return *g;
+    }
+    if matches!(trc, Trc::Identity) {
+        return 1.0;
+    }
+    // Pure-power parametric (type 0): single exponent, no offset.
+    if let Trc::Parametric(p) = trc {
+        if p.len() == 1 {
+            return p[0];
+        }
+    }
+
+    // Log-log linear fit on a sample grid in [0.05, 1.0]:
+    //   y = EOTF(x); fit  log(y) = g * log(x)  ⇒  g = Σ(log x · log y) / Σ(log x)²
+    let mut num = 0.0;
+    let mut den = 0.0;
+    let n = 64;
+    for i in 1..=n {
+        let x = 0.05 + (1.0 - 0.05) * (i as f64) / (n as f64);
+        let y = trc.eotf(x);
+        if y <= 0.0 {
+            continue;
+        }
+        let lx = x.ln();
+        let ly = y.ln();
+        num += lx * ly;
+        den += lx * lx;
+    }
+    if den.abs() < 1e-12 {
+        2.2
+    } else {
+        (num / den).clamp(1.0, 4.0)
     }
 }
 
@@ -502,7 +589,7 @@ mod tests {
             trc_g: Trc::Identity,
             trc_b: Trc::Identity,
         };
-        let t = profile.into_drm_transforms(256).unwrap();
+        let t = profile.into_drm_transforms(256, 256).unwrap();
         // Decode the 3×3 and check it's ≈ identity.
         let decode = |v: u64| -> f64 {
             let sign = if v & (1 << 63) != 0 { -1.0 } else { 1.0 };
@@ -517,5 +604,50 @@ mod tests {
                 assert!((got - expected).abs() < 1e-4, "ctm[{row},{col}] = {got} expected {expected}");
             }
         }
+    }
+
+    #[test]
+    fn estimate_gamma_pure_power() {
+        // A pure-power TRC should round-trip exactly.
+        assert!((estimate_gamma(&Trc::Gamma(2.2)) - 2.2).abs() < 1e-9);
+        // Parametric type 0 is the same shape.
+        assert!((estimate_gamma(&Trc::Parametric(vec![2.4])) - 2.4).abs() < 1e-9);
+        // Identity = gamma 1.
+        assert!((estimate_gamma(&Trc::Identity) - 1.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn estimate_gamma_srgb_parametric_fits_around_2_2() {
+        // sRGB parametric type 3 (the canonical sRGB curve in ICC profiles):
+        // g=2.4, a=1/1.055, b=0.055/1.055, c=1/12.92, d=0.04045.
+        let srgb = Trc::Parametric(vec![
+            2.4,
+            1.0 / 1.055,
+            0.055 / 1.055,
+            1.0 / 12.92,
+            0.04045,
+        ]);
+        let g = estimate_gamma(&srgb);
+        // A least-squares log-log fit of sRGB to a pure power lands around 2.0–2.1
+        // (sRGB's nominal "effective gamma 2.2" comes from a different fitting metric).
+        // For the passthrough use case this is close enough — accept anything in [1.9, 2.3].
+        assert!(
+            (1.9..=2.3).contains(&g),
+            "estimated gamma {g} for sRGB parametric outside [1.9, 2.3]"
+        );
+    }
+
+    #[test]
+    fn lut_size_two_is_accepted() {
+        // Smallest legal LUT size — make sure we don't underflow.
+        let profile = IccProfile {
+            xyz_matrix: SRGB_TO_XYZ_D50,
+            trc_r: Trc::Gamma(2.2),
+            trc_g: Trc::Gamma(2.2),
+            trc_b: Trc::Gamma(2.2),
+        };
+        let t = profile.into_drm_transforms(2, 2).unwrap();
+        assert_eq!(t.degamma.len(), 2);
+        assert_eq!(t.gamma.len(), 2);
     }
 }

@@ -374,12 +374,10 @@ struct TtyOutputState {
     crtc: crtc::Handle,
 }
 
-/// Output user data: inverse of the ICC CTM (display→sRGB, linear light).
-///
-/// Stored on the `Output` when an ICC profile with a valid CTM is applied to the CRTC.
-/// Read by `niri.rs::add_output()` to populate `OutputState::icc_ctm_inverse`.
+/// Output user data: parameters needed to pre-cancel the hardware ICC pipeline in the
+/// passthrough shader. Stored on the `Output` whenever an ICC profile is active on the CRTC.
 #[derive(Debug, Clone, Copy)]
-pub struct IccCtmInverse(pub [f32; 9]);
+pub struct IccPassthrough(pub crate::icc::IccPassthroughParams);
 
 struct Surface {
     name: OutputName,
@@ -1353,7 +1351,7 @@ impl Tty {
         }
 
         // Apply ICC profile if configured.
-        let icc_ctm_inverse = config
+        let icc_passthrough = config
             .icc_profile
             .as_ref()
             .and_then(|icc_path| apply_icc_to_gamma_props(&mut gamma_props, &device.drm, icc_path));
@@ -1416,8 +1414,8 @@ impl Tty {
         if let Some(x) = orientation {
             output.user_data().insert_if_missing(|| PanelOrientation(x));
         }
-        if let Some(inv) = icc_ctm_inverse {
-            output.user_data().insert_if_missing(|| IccCtmInverse(inv));
+        if let Some(params) = icc_passthrough {
+            output.user_data().insert_if_missing(|| IccPassthrough(params));
         }
 
         let render_node = device.render_node.unwrap_or(self.primary_render_node);
@@ -1911,15 +1909,15 @@ impl Tty {
         };
 
         // Render the elements.
-        let icc_ctm_inverse = niri
+        let icc_passthrough = niri
             .output_state
             .get(output)
-            .and_then(|s| s.icc_ctm_inverse);
+            .and_then(|s| s.icc_passthrough);
         let ctx = RenderCtx {
             renderer: &mut renderer,
             target: RenderTarget::Output,
             xray: None,
-            icc_ctm_inverse,
+            icc_passthrough,
         };
         let mut elements = niri.render_to_vec(ctx, output, true);
 
@@ -2708,6 +2706,15 @@ impl GammaProps {
     fn gamma_size(&self, device: &DrmDevice) -> anyhow::Result<u32> {
         let value = get_drm_property(device, self.crtc, self.gamma_lut_size)
             .context("missing GAMMA_LUT_SIZE property")?;
+        Ok(value as u32)
+    }
+
+    fn degamma_size(&self, device: &DrmDevice) -> anyhow::Result<u32> {
+        let prop = self
+            .degamma_lut_size
+            .context("CRTC has no DEGAMMA_LUT_SIZE property")?;
+        let value = get_drm_property(device, self.crtc, prop)
+            .context("missing DEGAMMA_LUT_SIZE property")?;
         Ok(value as u32)
     }
 
@@ -3625,21 +3632,44 @@ fn apply_icc_to_gamma_props(
     gamma_props: &mut Option<GammaProps>,
     device: &DrmDevice,
     path: &std::path::Path,
-) -> Option<[f32; 9]> {
-    let transforms = match crate::icc::load_icc(path) {
-        Ok(t) => t,
-        Err(err) => {
-            warn!("failed to load ICC profile {:?}: {err:?}", path);
-            return None;
-        }
-    };
-
+) -> Option<crate::icc::IccPassthroughParams> {
     let Some(props) = gamma_props else {
         warn!(
             "ICC profile configured but CRTC does not support GAMMA_LUT property; \
              ICC color management not applied"
         );
         return None;
+    };
+
+    let gamma_size = match props.gamma_size(device) {
+        Ok(n) => n as usize,
+        Err(err) => {
+            warn!("failed to query GAMMA_LUT_SIZE: {err:?}");
+            return None;
+        }
+    };
+
+    // DEGAMMA_LUT is optional on some CRTCs. Fall back to the GAMMA_LUT size for the sRGB
+    // linearisation table when DEGAMMA isn't supported (the table will be unused, but keeping
+    // `load_icc` non-fallible is simpler than threading an Option).
+    let degamma_size = if props.degamma_lut_size.is_some() {
+        match props.degamma_size(device) {
+            Ok(n) => n as usize,
+            Err(err) => {
+                warn!("failed to query DEGAMMA_LUT_SIZE: {err:?}");
+                return None;
+            }
+        }
+    } else {
+        gamma_size
+    };
+
+    let transforms = match crate::icc::load_icc(path, degamma_size, gamma_size) {
+        Ok(t) => t,
+        Err(err) => {
+            warn!("failed to load ICC profile {:?}: {err:?}", path);
+            return None;
+        }
     };
 
     if props.ctm.is_none() {
@@ -3653,8 +3683,14 @@ fn apply_icc_to_gamma_props(
         warn!("error applying ICC color transforms: {err:?}");
         None
     } else {
-        debug!("applied ICC profile {:?} to CRTC", path);
-        Some(transforms.ctm_inverse)
+        debug!(
+            "applied ICC profile {:?} (degamma={degamma_size} gamma={gamma_size}) to CRTC",
+            path
+        );
+        Some(crate::icc::IccPassthroughParams {
+            ctm_inverse: transforms.ctm_inverse,
+            display_gamma: transforms.display_gamma,
+        })
     }
 }
 

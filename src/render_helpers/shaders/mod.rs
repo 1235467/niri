@@ -154,7 +154,10 @@ impl Shaders {
         let icc_passthrough = renderer
             .compile_custom_texture_shader(
                 include_str!("icc_passthrough.frag"),
-                &[UniformName::new("icc_ctm_inverse", UniformType::Matrix3x3)],
+                &[
+                    UniformName::new("icc_ctm_inverse", UniformType::Matrix3x3),
+                    UniformName::new("display_gamma", UniformType::_3f),
+                ],
             )
             .map_err(|err| {
                 warn!("error compiling ICC passthrough shader: {err:?}");

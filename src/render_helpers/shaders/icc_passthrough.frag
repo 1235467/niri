@@ -1,20 +1,25 @@
 // Fragment shader for ICC passthrough windows.
 //
-// When the DRM CRTC has a CTM (color transform matrix) applied for ICC color management,
-// color-managed applications (mpv, Krita, Firefox with color management enabled) output pixels
-// that are already in the display's native color space. However the DRM CTM will then also be
-// applied on top, causing double-correction.
+// When an ICC profile is active on the output, the hardware applies a 3-stage color
+// pipeline to whatever the compositor writes to the framebuffer:
 //
-// This shader counteracts the DRM CTM by applying its inverse (ctm_inverse, display→sRGB) in the
-// GPU compositing step, so that after the hardware CTM the window ends up unchanged.
+//     panel = GAMMA_LUT( CTM( DEGAMMA_LUT( shader_output ) ) )
 //
-// Math:
-//   GPU applies:  ctm_inverse  (display-native → sRGB)
-//   DRM applies:  CTM          (sRGB → display-native)
-//   Net effect:   CTM × ctm_inverse = I  (identity)
+// where DEGAMMA_LUT is the sRGB EOTF (encoded → linear), CTM converts sRGB linear to
+// display-native linear, and GAMMA_LUT applies the display's TRC (linear → encoded
+// signal). For a color-managed app (mpv, Krita, Firefox with CMS) the pixel `p` it
+// writes is *already* the encoded signal it wants the panel to receive. So we need
+// the shader to produce `s` such that the pipeline above outputs `p`:
 //
-// Both matrices operate in linear light.  We linearise the sampled sRGB colour, apply the
-// matrix, and re-encode to sRGB before writing gl_FragColor.
+//     GAMMA_LUT( CTM( DEGAMMA_LUT(s) ) ) = p
+//   ⇒ CTM( DEGAMMA_LUT(s) ) = display_eotf(p)            // invert GAMMA_LUT
+//   ⇒ DEGAMMA_LUT(s) = ctm_inverse · display_eotf(p)     // invert CTM
+//   ⇒ s = srgb_oetf( ctm_inverse · display_eotf(p) )     // invert DEGAMMA_LUT
+//
+// So the shader: linearises with the **display** TRC (not sRGB!), multiplies by the
+// inverse CTM, then re-encodes with the **sRGB** OETF (matching the hardware DEGAMMA).
+// Linearising with sRGB instead of the display TRC was the bug in the first version
+// of this shader — it would only round-trip when the display TRC was sRGB-shaped.
 
 #version 100
 
@@ -39,27 +44,23 @@ varying vec2 v_coords;
 uniform float tint;
 #endif
 
-// Inverse of the DRM CTM (display-native → sRGB, linear light), stored column-major.
+// Inverse of the DRM CTM (display-native linear → sRGB linear), column-major after
+// upload (we pass row-major data with transpose=true).
 uniform mat3 icc_ctm_inverse;
 
-// sRGB EOTF: encoded → linear
-float srgb_to_linear_channel(float c) {
-    if (c <= 0.04045) {
-        return c / 12.92;
-    } else {
-        return pow((c + 0.055) / 1.055, 2.4);
-    }
+// Per-channel display gamma exponent: `display_linear = encoded^display_gamma`.
+// This is the EOTF of the panel's TRC, approximated as a pure power per channel
+// (exact for ICC pure-power profiles; a least-squares fit for parametric/sampled
+// curves — matches typical display TRCs within ~1 LSB).
+uniform vec3 display_gamma;
+
+// Display TRC EOTF (encoded → linear) using the per-channel power approximation.
+vec3 display_to_linear(vec3 c) {
+    c = max(c, vec3(0.0));
+    return pow(c, display_gamma);
 }
 
-vec3 srgb_to_linear(vec3 c) {
-    return vec3(
-        srgb_to_linear_channel(c.r),
-        srgb_to_linear_channel(c.g),
-        srgb_to_linear_channel(c.b)
-    );
-}
-
-// sRGB OETF: linear → encoded
+// sRGB OETF: linear → encoded. Matches what hardware DEGAMMA_LUT inverts.
 float linear_to_srgb_channel(float c) {
     c = clamp(c, 0.0, 1.0);
     if (c <= 0.0031308) {
@@ -83,20 +84,18 @@ void main() {
     color = vec4(color.rgb, 1.0);
 #endif
 
-    // Pre-multiply alpha before colour transform to avoid colour bleeding at edges.
-    // (The app's output is already pre-multiplied if it uses standard Wayland alpha.)
-    // We work on straight-alpha for the colour math and re-multiply at the end.
+    // Wayland surfaces use premultiplied alpha. Work on straight-alpha for the colour
+    // math (linearisation and the CTM are non-linear / not alpha-affine), then re-multiply.
     float a = color.a;
     vec3 rgb = (a > 0.0) ? color.rgb / a : vec3(0.0);
 
-    // Linearise sRGB, apply inverse CTM, re-encode.
-    rgb = srgb_to_linear(rgb);
+    // Linearise with the display TRC, undo the CTM, re-encode with the sRGB OETF that
+    // the hardware DEGAMMA_LUT inverts.
+    rgb = display_to_linear(rgb);
     rgb = icc_ctm_inverse * rgb;
     rgb = linear_to_srgb(rgb);
 
-    // Re-apply alpha.
     color = vec4(rgb * a, a);
-
     color = color * alpha;
 
 #if defined(DEBUG_FLAGS)

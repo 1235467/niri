@@ -549,7 +549,7 @@ impl Mapped {
                 renderer,
                 target: RenderTarget::Screencast,
                 xray: None,
-                icc_ctm_inverse: None,
+                icc_passthrough: None,
             },
             location,
             scale,
@@ -663,20 +663,21 @@ impl LayoutElement for Mapped {
             let buf_pos = location - self.window.geometry().loc.to_f64();
             let surface = self.toplevel().wl_surface();
 
-            // Apply the ICC passthrough shader when:
-            //   1. The window rule `icc-passthrough true` is set.
-            //   2. We're rendering to the output (DRM CTM is active).
-            //   3. The output actually has an ICC CTM (icc_ctm_inverse is Some).
+            // Apply the ICC passthrough shader when the window rule `icc-passthrough true`
+            // is set, we're rendering to the output (where the DRM color pipeline applies),
+            // and the output actually has an ICC profile active.
             let icc_shader = if self.rules.icc_passthrough == Some(true) {
-                ctx.icc_ctm_inverse
-                    .and_then(|inv| IccPassthroughRenderElement::shader(ctx.renderer).map(|s| (s.clone(), inv)))
+                ctx.icc_passthrough.and_then(|params| {
+                    IccPassthroughRenderElement::shader(ctx.renderer)
+                        .map(|s| (s.clone(), params))
+                })
             } else {
                 None
             };
 
-            if let Some((shader, ctm_inverse)) = icc_shader {
+            if let Some((shader, params)) = icc_shader {
                 let mut push_wrapped = |elem: WaylandSurfaceRenderElement<R>| {
-                    push(IccPassthroughRenderElement::new(elem, shader.clone(), ctm_inverse).into())
+                    push(IccPassthroughRenderElement::new(elem, shader.clone(), params).into())
                 };
                 push_elements_from_surface_tree(
                     ctx.renderer,

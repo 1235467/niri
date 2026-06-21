@@ -427,8 +427,8 @@ impl Thumbnail {
                 elem.into()
             }
             elem @ LayoutElementRenderElement::IccPassthrough(_) => {
-                // ICC passthrough is only active when icc_ctm_inverse is Some, which is never the
-                // case for thumbnail rendering. Pass through without the ICC shader.
+                // ICC passthrough is only active when ctx.icc_passthrough is Some, which is
+                // never the case for thumbnail rendering. Pass through without the ICC shader.
                 elem.into()
             }
         };
